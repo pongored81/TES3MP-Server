@@ -5,6 +5,38 @@ function string:split(sep)
     return fields
 end
 
+-- Check for case-insensitive equality
+function string:ciEqual(otherString)
+
+    if type(otherString) ~= "string" then return false end
+
+    return self:lower() == otherString:lower()
+end
+
+function string:trim()
+    return (self:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+function prefixZeroes(inputString, desiredLength)
+
+    local length = string.len(inputString)
+
+    while length < desiredLength do
+        inputString = "0" .. inputString
+        length = length + 1
+    end
+
+    return inputString
+end
+
+-- Based on https://stackoverflow.com/a/34965917
+function prequire(...)
+    local status, lib = pcall(require, ...)
+    if status then return lib end
+
+    return nil
+end
+
 function doesModuleExist(name)
     if package.loaded[name] then
         return true

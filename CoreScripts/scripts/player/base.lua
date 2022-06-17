@@ -1,5 +1,4 @@
 require("config")
-require("actionTypes")
 require("patterns")
 stateHelper = require("stateHelper")
 tableHelper = require("tableHelper")
@@ -15,9 +14,14 @@ function BasePlayer:__init(pid, playerName)
             password = ""
         },
         settings = {
-            admin = 0,
+            staffRank = 0,
+            difficulty = "default",
             consoleAllowed = "default",
-            difficulty = "default"
+            bedRestAllowed = "default",
+            wildernessRestAllowed = "default",
+            waitAllowed = "default",
+            enforcedLogLevel = "default",
+            physicsFramerate = "default"
         },
         character = {
             race = "",
@@ -29,6 +33,7 @@ function BasePlayer:__init(pid, playerName)
         },
         location = {
             cell = "",
+            regionName = "",
             posX = 0,
             posY = 0,
             posZ = 0,
@@ -43,18 +48,30 @@ function BasePlayer:__init(pid, playerName)
             magickaBase = 1,
             magickaCurrent = 1,
             fatigueBase = 1,
-            fatigueCurrent = 1,
-            bounty = 0
+            fatigueCurrent = 1
+        },
+        fame = {
+            bounty = 0,
+            reputation = 0
+        },
+        miscellaneous = {
+            markLocation = {
+                cell = "",
+                posX = 0,
+                posY = 0,
+                posZ = 0,
+                rotX = 0,
+                rotZ = 0
+            },
+            selectedSpell = ""
         },
         customClass = {},
         attributes = {},
-        attributes = {},
-        attributeSkillIncreases = {},
         skills = {},
-        skillProgress = {},
         equipment = {},
         inventory = {},
         spellbook = {},
+        quickKeys = {},
         shapeshift = {},
         journal = {},
         factionRanks = {},
@@ -64,19 +81,26 @@ function BasePlayer:__init(pid, playerName)
         books = {},
         mapExplored = {},
         ipAddresses = {},
-        customVariables= {}
-    };
+        recordLinks = {},
+        customVariables = {}
+    }
 
-    for i = 0, (tes3mp.GetAttributeCount() - 1) do
-        local attributeName = tes3mp.GetAttributeName(i)
-        self.data.attributes[attributeName] = 1
-        self.data.attributeSkillIncreases[attributeName] = 0
+    for index = 0, (tes3mp.GetAttributeCount() - 1) do
+        local attributeName = tes3mp.GetAttributeName(index)
+        self.data.attributes[attributeName] = {
+            base = 1,
+            damage = 0,
+            skillIncrease = 0
+        }
     end
 
-    for i = 0, (tes3mp.GetSkillCount() - 1) do
-        local skillName = tes3mp.GetSkillName(i)
-        self.data.skills[skillName] = 1
-        self.data.skillProgress[skillName] = 0
+    for index = 0, (tes3mp.GetSkillCount() - 1) do
+        local skillName = tes3mp.GetSkillName(index)
+        self.data.skills[skillName] = {
+            base = 1,
+            damage = 0,
+            progress = 0
+        }
     end
 
     self.initTimestamp = os.time()
@@ -89,17 +113,22 @@ function BasePlayer:__init(pid, playerName)
 
     self.pid = pid
     self.loggedIn = false
-    self.tid_login = nil
-    self.admin = 0
-    self.hasAccount = nil -- TODO Check whether account file exists
+    self.isNewlyRegistered = false
+    self.loginTimerId = nil
+    self.hasAccount = nil
 
     self.cellsLoaded = {}
+    self.summons = {}
+    self.generatedRecordsReceived = {}
+    self.unresolvedEnchantments = {}
+
+    self.hasFinishedInitialTeleportation = false
 end
 
 function BasePlayer:Destroy()
-    if self.tid_login ~= nil then
-        tes3mp.StopTimer(self.tid_login)
-        self.tid_login = nil
+    if self.loginTimerId ~= nil then
+        tes3mp.StopTimer(self.loginTimerId)
+        self.loginTimerId = nil
     end
 
     self.loggedIn = false
@@ -111,34 +140,61 @@ function BasePlayer:Kick()
     tes3mp.Kick(self.pid)
 end
 
-function BasePlayer:Registered(passw)
+function BasePlayer:Register(password)
     self.loggedIn = true
-    self.data.login.password = passw
+    self.isNewlyRegistered = true
+    self.data.login.password = password
     self.data.settings.consoleAllowed = "default"
-    if self.hasAccount == false then -- create account
+
+    if not self.hasAccount then
         tes3mp.SetCharGenStage(self.pid, 1, 4)
     end
 end
 
 function BasePlayer:FinishLogin()
-    self.loggedIn = true
-    if self.hasAccount ~= false then -- load account
+
+    if self.hasAccount then
         self:SaveIpAddress()
+
+        self:LoadSettings()
         self:LoadCharacter()
         self:LoadClass()
         self:LoadLevel()
         self:LoadAttributes()
         self:LoadSkills()
         self:LoadStatsDynamic()
-        self:LoadBounty()
-        self:LoadCell()
+
+        WorldInstance:LoadTime(self.pid, false)
+        WorldInstance:LoadWeather(self.pid, false)
+
+        if self.data.recordLinks == nil then self.data.recordLinks = {} end
+
+        for _, storeType in ipairs(config.recordStoreLoadOrder) do
+            local recordStore = RecordStores[storeType]
+
+            if recordStore ~= nil then
+                -- Load all the permanent records in this record store
+                recordStore:LoadRecords(self.pid, recordStore.data.permanentRecords,
+                    tableHelper.getArrayFromIndexes(recordStore.data.permanentRecords))
+
+                -- Load the generated records linked to us in this record store
+                if self.data.recordLinks[storeType] ~= nil then
+                    recordStore:LoadGeneratedRecords(self.pid, recordStore.data.generatedRecords,
+                        self.data.recordLinks[storeType])
+                end
+            end
+        end
+
+        self:CleanInventory()
         self:LoadInventory()
         self:LoadEquipment()
+        self:CleanSpellbook()
         self:LoadSpellbook()
+        self:LoadQuickKeys()
         self:LoadBooks()
-        --self:LoadMap()
         self:LoadShapeshift()
-        self:LoadSettings()
+        self:LoadMarkLocation()
+        self:LoadSelectedSpell()
 
         if config.shareJournal == true then
             WorldInstance:LoadJournal(self.pid)
@@ -170,7 +226,34 @@ function BasePlayer:FinishLogin()
             self:LoadTopics()
         end
 
+        if config.shareBounty == true then
+            WorldInstance:LoadBounty(self.pid)
+        else
+            self:LoadBounty()
+        end
+
+        if config.shareReputation == true then
+            WorldInstance:LoadReputation(self.pid)
+        else
+            self:LoadReputation()
+        end
+
         WorldInstance:LoadKills(self.pid)
+
+        self:LoadSpecialStates()
+
+        if config.shareMapExploration == true then
+            WorldInstance:LoadMap(self.pid)
+        else
+            self:LoadMap()
+        end
+
+        self:LoadCell()
+
+        self.loggedIn = true
+        
+        customEventHooks.triggerHandlers("OnPlayerFinishLogin", customEventHooks.makeEventStatus(true, true), {self.pid})
+        customEventHooks.triggerHandlers("OnPlayerAuthentified", customEventHooks.makeEventStatus(true, true), {self.pid})
     end
 end
 
@@ -182,6 +265,17 @@ function BasePlayer:EndCharGen()
     self:SaveEquipment()
     self:SaveIpAddress()
     self:CreateAccount()
+
+    WorldInstance:LoadTime(self.pid, false)
+    WorldInstance:LoadWeather(self.pid, false, true)
+
+    for _, storeType in ipairs(config.recordStoreLoadOrder) do
+        local recordStore = RecordStores[storeType]
+
+        -- Load all the permanent records in this record store
+        recordStore:LoadRecords(self.pid, recordStore.data.permanentRecords,
+            tableHelper.getArrayFromIndexes(recordStore.data.permanentRecords))
+    end
 
     if config.shareJournal == true then
         WorldInstance:LoadJournal(self.pid)
@@ -202,7 +296,7 @@ function BasePlayer:EndCharGen()
     if config.shareTopics == true then
         WorldInstance:LoadTopics(self.pid)
     end
-    
+
     WorldInstance:LoadKills(self.pid)
 
     if config.defaultSpawnCell ~= nil then
@@ -211,7 +305,8 @@ function BasePlayer:EndCharGen()
         tes3mp.SendCell(self.pid)
 
         if config.defaultSpawnPos ~= nil and config.defaultSpawnRot ~= nil then
-            tes3mp.SetPos(self.pid, config.defaultSpawnPos[1], config.defaultSpawnPos[2], config.defaultSpawnPos[3])
+            tes3mp.SetPos(self.pid, config.defaultSpawnPos[1],
+                config.defaultSpawnPos[2], config.defaultSpawnPos[3])
             tes3mp.SetRot(self.pid, config.defaultSpawnRot[1], config.defaultSpawnRot[2])
             tes3mp.SendPos(self.pid)
         end
@@ -219,11 +314,13 @@ function BasePlayer:EndCharGen()
 
     if config.shareJournal == true and WorldInstance.data.customVariables ~= nil then
         if WorldInstance.data.customVariables.deliveredCaiusPackage ~= true then
-            local item = { refId = "bk_a1_1_caiuspackage", count = 1, charge = -1 }
-            table.insert(self.data.inventory, item)
-            self:LoadInventory()
-            self:LoadEquipment()
-            tes3mp.MessageBox(self.pid, -1, "Multiplayer skips over the original character generation.\n\nAs a result, you start out with Caius Cosades' package.")
+            local item = { refId = "bk_a1_1_caiuspackage", count = 1, charge = -1,
+                enchantmentCharge = -1, soul = "" }
+            inventoryHelper.addItem(self.data.inventory, item.refId, item.count, item.charge,
+                item.enchantmentCharge, item.soul)
+            self:LoadItemChanges({item}, enumerations.inventory.ADD)
+            tes3mp.MessageBox(self.pid, -1, "Multiplayer skips over the original character generation." ..
+                "\n\nAs a result, you start out with Caius Cosades' package.")
         end
     end
 end
@@ -232,20 +329,64 @@ function BasePlayer:IsLoggedIn()
     return self.loggedIn
 end
 
+function BasePlayer:IsServerStaff()
+    return self.data.settings.staffRank > 0
+end
+
+function BasePlayer:IsServerOwner()
+    return self.data.settings.staffRank == 3
+end
+
 function BasePlayer:IsAdmin()
-    return self.data.settings.admin == 2
+    return self.data.settings.staffRank >= 2
 end
 
 function BasePlayer:IsModerator()
-    return self.data.settings.admin >= 1
+    return self.data.settings.staffRank >= 1
 end
 
-function BasePlayer:PromoteModerator(other)
-    if self.IsAdmin() then
-        other.data.settings.admin = 1
-        return true
+function BasePlayer:AddLinkToRecord(storeType, recordId)
+
+    if self.data.recordLinks == nil then self.data.recordLinks = {} end
+
+    local recordStore = RecordStores[storeType]
+
+    if recordStore ~= nil then
+
+        local recordLinks = self.data.recordLinks
+
+        if recordLinks[storeType] == nil then recordLinks[storeType] = {} end
+
+        if not tableHelper.containsValue(recordLinks[storeType], recordId) then
+            table.insert(recordLinks[storeType], recordId)
+        end
+
+        recordStore:AddLinkToPlayer(recordId, self)
+        recordStore:QuicksaveToDrive()
     end
-    return false
+end
+
+function BasePlayer:RemoveLinkToRecord(storeType, recordId)
+
+    local recordStore = RecordStores[storeType]
+
+    if recordStore ~= nil then
+
+        local recordLinks = self.data.recordLinks
+
+        if recordLinks ~= nil and recordLinks[storeType] ~= nil then
+
+            local linkIndex = tableHelper.getIndexByValue(recordLinks[storeType], recordId)
+
+            if linkIndex ~= nil then
+                recordLinks[storeType][linkIndex] = nil
+                tableHelper.cleanNils(recordLinks[storeType])
+            end
+
+            recordStore:RemoveLinkToPlayer(recordId, self)
+            recordStore:QuicksaveToDrive()
+        end
+    end
 end
 
 function BasePlayer:GetHealthCurrent()
@@ -280,11 +421,11 @@ function BasePlayer:CreateAccount()
     error("Not implemented")
 end
 
-function BasePlayer:Save()
+function BasePlayer:SaveToDrive()
     error("Not implemented")
 end
 
-function BasePlayer:Load()
+function BasePlayer:LoadFromDrive()
     error("Not implemented")
 end
 
@@ -299,58 +440,69 @@ function BasePlayer:SaveIpAddress()
 
     local ipAddress = tes3mp.GetIP(self.pid)
 
-    if tableHelper.containsValue(self.data.ipAddresses, ipAddress) == false then
+    if not tableHelper.containsValue(self.data.ipAddresses, ipAddress) then
         table.insert(self.data.ipAddresses, ipAddress)
     end
 end
 
 function BasePlayer:ProcessDeath()
 
-    local deathReason = tes3mp.GetDeathReason(self.pid)
+    local deathReason = "committed suicide"
 
-    tes3mp.LogMessage(1, "Original death reason was " .. deathReason)
+    if tes3mp.DoesPlayerHavePlayerKiller(self.pid) then
+        local killerPid = tes3mp.GetPlayerKillerPid(self.pid)
 
-    if deathReason == "suicide" then
-        deathReason = "committed suicide"
+        if self.pid ~= killerPid then
+            deathReason = "was killed by player " .. logicHandler.GetChatName(killerPid)
+        end
     else
-        deathReason = "was killed by " .. deathReason
+        local killerName = tes3mp.GetPlayerKillerName(self.pid)
+
+        if killerName ~= "" then
+            deathReason = "was killed by " .. killerName
+        end
     end
 
-    local message = ("%s (%d) %s"):format(self.data.login.name, self.pid, deathReason)
+    local message = logicHandler.GetChatName(self.pid) .. " " .. deathReason .. ".\n"
 
-    message = message .. ".\n"
     tes3mp.SendMessage(self.pid, message, true)
 
-    self.tid_resurrect = tes3mp.CreateTimerEx("OnDeathTimeExpiration", time.seconds(config.deathTime), "i", self.pid)
-    tes3mp.StartTimer(self.tid_resurrect);
+    if config.playersRespawn then
+        self.resurrectTimerId = tes3mp.CreateTimerEx("OnDeathTimeExpiration",
+            time.seconds(config.deathTime), "i", self.pid)
+        tes3mp.StartTimer(self.resurrectTimerId)
+    else
+        tes3mp.SendMessage(self.pid, "You have died permanently.", false)
+    end
 end
 
 function BasePlayer:Resurrect()
 
-    local currentResurrectType
+    local currentResurrectType = enumerations.resurrect.REGULAR
 
     if config.respawnAtImperialShrine == true then
         if config.respawnAtTribunalTemple == true then
             if math.random() > 0.5 then
-                currentResurrectType = actionTypes.resurrect.IMPERIAL_SHRINE
+                currentResurrectType = enumerations.resurrect.IMPERIAL_SHRINE
             else
-                currentResurrectType = actionTypes.resurrect.TRIBUNAL_TEMPLE
+                currentResurrectType = enumerations.resurrect.TRIBUNAL_TEMPLE
             end
         else
-            currentResurrectType = actionTypes.resurrect.IMPERIAL_SHRINE
+            currentResurrectType = enumerations.resurrect.IMPERIAL_SHRINE
         end
 
     elseif config.respawnAtTribunalTemple == true then
-        currentResurrectType = actionTypes.resurrect.TRIBUNAL_TEMPLE
+        currentResurrectType = enumerations.resurrect.TRIBUNAL_TEMPLE
 
     elseif config.defaultRespawnCell ~= nil then
-        currentResurrectType = actionTypes.resurrect.REGULAR
+        currentResurrectType = enumerations.resurrect.REGULAR
 
         tes3mp.SetCell(self.pid, config.defaultRespawnCell)
         tes3mp.SendCell(self.pid)
 
         if config.defaultRespawnPos ~= nil and config.defaultRespawnRot ~= nil then
-            tes3mp.SetPos(self.pid, config.defaultRespawnPos[1], config.defaultRespawnPos[2], config.defaultRespawnPos[3])
+            tes3mp.SetPos(self.pid, config.defaultRespawnPos[1],
+                config.defaultRespawnPos[2], config.defaultRespawnPos[3])
             tes3mp.SetRot(self.pid, config.defaultRespawnRot[1], config.defaultRespawnRot[2])
             tes3mp.SendPos(self.pid)
         end
@@ -358,9 +510,9 @@ function BasePlayer:Resurrect()
 
     local message = "You have been revived"
 
-    if currentResurrectType == actionTypes.resurrect.IMPERIAL_SHRINE then
+    if currentResurrectType == enumerations.resurrect.IMPERIAL_SHRINE then
         message = message .. " at the nearest Imperial shrine"
-    elseif currentResurrectType == actionTypes.resurrect.TRIBUNAL_TEMPLE then
+    elseif currentResurrectType == enumerations.resurrect.TRIBUNAL_TEMPLE then
         message = message .. " at the nearest Tribunal temple"
     end
 
@@ -371,13 +523,63 @@ function BasePlayer:Resurrect()
         self:SetWerewolfState(false)
     end
 
+    -- Ensure that we unequip deadly items when applicable, to prevent an
+    -- infinite death loop
+    contentFixer.UnequipDeadlyItems(self.pid)
+
     tes3mp.Resurrect(self.pid, currentResurrectType)
 
-    if config.deathPenaltyJailDays > 0 then
-        tes3mp.Jail(self.pid, config.deathPenaltyJailDays, true, true, "Recovering", "You've been revived and brought back here, but your skills have been affected by your time spent incapacitated.")
+    if config.deathPenaltyJailDays > 0 or config.bountyDeathPenalty then
+        local jailTime = 0
+        local resurrectionText = "You've been revived and brought back here, " ..
+            "but your skills have been affected by "
+
+        if config.bountyDeathPenalty then
+            local currentBounty = tes3mp.GetBounty(self.pid)
+
+            if currentBounty > 0 then
+                jailTime = jailTime + math.floor(currentBounty / 100)
+                resurrectionText = resurrectionText .. "your bounty"
+            end
+        end
+
+        if config.deathPenaltyJailDays > 0 then
+            if jailTime > 0 then
+                resurrectionText = resurrectionText .. " and "
+            end
+
+            jailTime = jailTime + config.deathPenaltyJailDays
+            resurrectionText = resurrectionText .. "your time spent incapacitated"    
+        end
+
+        resurrectionText = resurrectionText .. ".\n"
+        tes3mp.Jail(self.pid, jailTime, true, true, "Recovering", resurrectionText)
+    end
+
+    if config.bountyResetOnDeath then
+        tes3mp.SetBounty(self.pid, 0)
+        tes3mp.SendBounty(self.pid)
+        self:SaveBounty()
     end
 
     tes3mp.SendMessage(self.pid, message, false)
+end
+
+function BasePlayer:DeleteSummons()
+
+    if self.summons ~= nil then
+        for summonUniqueIndex, summonRefId in pairs(self.summons) do
+            tes3mp.LogAppend(enumerations.log.INFO, "- removing player's summon " .. summonUniqueIndex ..
+                ", refId " .. summonRefId)
+
+            local cell = logicHandler.GetCellContainingActor(summonUniqueIndex)
+
+            if cell ~= nil then
+                cell:DeleteObjectData(summonUniqueIndex)
+                logicHandler.DeleteObjectForEveryone(cell.description, summonUniqueIndex)
+            end
+        end
+    end
 end
 
 function BasePlayer:LoadCharacter()
@@ -409,22 +611,22 @@ function BasePlayer:LoadClass()
             tes3mp.SetClassDesc(self.pid, self.data.customClass.description)
         end
 
-        local i = 0
+        local index = 0
         for value in string.gmatch(self.data.customClass.majorAttributes, patterns.commaSplit) do
-            tes3mp.SetClassMajorAttribute(self.pid, i, tes3mp.GetAttributeId(value))
-            i = i + 1
+            tes3mp.SetClassMajorAttribute(self.pid, index, tes3mp.GetAttributeId(value))
+            index = index + 1
         end
 
-        i = 0
+        index = 0
         for value in string.gmatch(self.data.customClass.majorSkills, patterns.commaSplit) do
-            tes3mp.SetClassMajorSkill(self.pid, i, tes3mp.GetSkillId(value))
-            i = i + 1
+            tes3mp.SetClassMajorSkill(self.pid, index, tes3mp.GetSkillId(value))
+            index = index + 1
         end
 
-        i = 0
+        index = 0
         for value in string.gmatch(self.data.customClass.minorSkills, patterns.commaSplit) do
-            tes3mp.SetClassMinorSkill(self.pid, i, tes3mp.GetSkillId(value))
-            i = i + 1
+            tes3mp.SetClassMinorSkill(self.pid, index, tes3mp.GetSkillId(value))
+            index = index + 1
         end
     end
 
@@ -443,13 +645,13 @@ function BasePlayer:SaveClass()
         local majorSkills = {}
         local minorSkills = {}
 
-        for i = 0, 1, 1 do
-            majorAttributes[i + 1] = tes3mp.GetAttributeName(tonumber(tes3mp.GetClassMajorAttribute(self.pid, i)))
+        for index = 0, 1, 1 do
+            majorAttributes[index + 1] = tes3mp.GetAttributeName(tonumber(tes3mp.GetClassMajorAttribute(self.pid, index)))
         end
 
-        for i = 0, 4, 1 do
-            majorSkills[i + 1] = tes3mp.GetSkillName(tonumber(tes3mp.GetClassMajorSkill(self.pid, i)))
-            minorSkills[i + 1] = tes3mp.GetSkillName(tonumber(tes3mp.GetClassMinorSkill(self.pid, i)))
+        for index = 0, 4, 1 do
+            majorSkills[index + 1] = tes3mp.GetSkillName(tonumber(tes3mp.GetClassMajorSkill(self.pid, index)))
+            minorSkills[index + 1] = tes3mp.GetSkillName(tonumber(tes3mp.GetClassMinorSkill(self.pid, index)))
         end
 
         self.data.customClass.majorAttributes = table.concat(majorAttributes, ", ")
@@ -459,7 +661,16 @@ function BasePlayer:SaveClass()
 end
 
 function BasePlayer:LoadStatsDynamic()
-    tes3mp.SetHealthBase(self.pid, self.data.stats.healthBase)
+
+    local healthBase
+
+    if tes3mp.IsWerewolf(self.pid) then
+        healthBase = self.data.shapeshift.werewolfHealthBase
+    else
+        healthBase = self.data.stats.healthBase
+    end
+
+    tes3mp.SetHealthBase(self.pid, healthBase)
     tes3mp.SetMagickaBase(self.pid, self.data.stats.magickaBase)
     tes3mp.SetFatigueBase(self.pid, self.data.stats.fatigueBase)
     tes3mp.SetHealthCurrent(self.pid, self.data.stats.healthCurrent)
@@ -470,162 +681,276 @@ function BasePlayer:LoadStatsDynamic()
 end
 
 function BasePlayer:SaveStatsDynamic()
-    self.data.stats.healthBase = tes3mp.GetHealthBase(self.pid)
-    self.data.stats.magickaBase = tes3mp.GetMagickaBase(self.pid)
-    self.data.stats.fatigueBase = tes3mp.GetFatigueBase(self.pid)
-    self.data.stats.healthCurrent = tes3mp.GetHealthCurrent(self.pid)
-    self.data.stats.magickaCurrent = tes3mp.GetMagickaCurrent(self.pid)
-    self.data.stats.fatigueCurrent = tes3mp.GetFatigueCurrent(self.pid)
+
+    local healthBase = tes3mp.GetHealthBase(self.pid)
+
+    -- Sometimes, the player's base health gets set to 1 serverside;
+    -- use this temporary fix until we figure out why
+    if healthBase > 1 then
+
+        if tes3mp.IsWerewolf(self.pid) then
+            self.data.shapeshift.werewolfHealthBase = healthBase
+        else
+            self.data.stats.healthBase = healthBase
+        end
+
+        self.data.stats.magickaBase = tes3mp.GetMagickaBase(self.pid)
+        self.data.stats.fatigueBase = tes3mp.GetFatigueBase(self.pid)
+        self.data.stats.healthCurrent = tes3mp.GetHealthCurrent(self.pid)
+        self.data.stats.magickaCurrent = tes3mp.GetMagickaCurrent(self.pid)
+        self.data.stats.fatigueCurrent = tes3mp.GetFatigueCurrent(self.pid)
+    end
 end
 
 function BasePlayer:LoadAttributes()
+
     for name, value in pairs(self.data.attributes) do
-        tes3mp.SetAttributeBase(self.pid, tes3mp.GetAttributeId(name), value)
+        local attributeId = tes3mp.GetAttributeId(name)
+
+        if type(value) == "table" then
+            tes3mp.SetAttributeBase(self.pid, attributeId, value.base)
+            tes3mp.SetAttributeDamage(self.pid, attributeId, value.damage)
+            tes3mp.SetSkillIncrease(self.pid, attributeId, value.skillIncrease)
+
+        -- Maintain backwards compatibility with the old way of storing skills
+        elseif type(value) == "number" then
+            tes3mp.SetAttributeBase(self.pid, attributeId, value)
+        end
     end
 
     tes3mp.SendAttributes(self.pid)
 end
 
 function BasePlayer:SaveAttributes()
+
     for name in pairs(self.data.attributes) do
+
         local attributeId = tes3mp.GetAttributeId(name)
-        self.data.attributes[name] = tes3mp.GetAttributeBase(self.pid, attributeId)
+
+        local baseValue = tes3mp.GetAttributeBase(self.pid, attributeId)
+        local modifierValue = tes3mp.GetAttributeModifier(self.pid, attributeId)
+        local maxAttributeValue = config.maxAttributeValue
+
+        if name == "Speed" then
+            maxAttributeValue = config.maxSpeedValue
+        end
+
+        if baseValue > maxAttributeValue then
+            self:LoadAttributes()
+
+            local message = "Your base " .. name .. " has exceeded the maximum allowed value " ..
+                "and been reset to its last recorded one.\n"
+            tes3mp.SendMessage(self.pid, message)
+        elseif (baseValue + modifierValue) > maxAttributeValue then
+            tes3mp.ClearAttributeModifier(self.pid, attributeId)
+            tes3mp.SendAttributes(self.pid)
+
+            local message = "Your " .. name .. " fortification has exceeded the maximum allowed " ..
+                "value and been removed.\n"
+            tes3mp.SendMessage(self.pid, message)
+        else
+            self.data.attributes[name] = {
+                base = baseValue,
+                damage = tes3mp.GetAttributeDamage(self.pid, attributeId),
+                skillIncrease = tes3mp.GetSkillIncrease(self.pid, attributeId)
+            }
+
+            -- Remove old tables for attribute bonuses on level up from skill increases
+            if self.data.attributeSkillIncreases ~= nil and self.data.attributeSkillIncreases[name] ~= nil then
+                self.data.attributeSkillIncreases[name] = nil
+            end
+        end
+    end
+
+    -- Remove traces of old way of saving attribute bonuses on level up
+    if self.data.attributeSkillIncreases ~= nil and tableHelper.isEmpty(self.data.attributeSkillIncreases) then
+        self.data.attributeSkillIncreases = nil
     end
 end
 
 function BasePlayer:LoadSkills()
+
     for name, value in pairs(self.data.skills) do
-        tes3mp.SetSkillBase(self.pid, tes3mp.GetSkillId(name), value)
+
+        local skillId = tes3mp.GetSkillId(name)
+
+        if type(value) == "table" then
+            tes3mp.SetSkillBase(self.pid, skillId, value.base)
+            tes3mp.SetSkillDamage(self.pid, skillId, value.damage)
+            tes3mp.SetSkillProgress(self.pid, skillId, value.progress)
+
+        -- Maintain backwards compatibility with the old way of storing skills
+        elseif type(value) == "number" then
+            tes3mp.SetSkillBase(self.pid, skillId, value)
+        end
     end
 
-    for name, value in pairs(self.data.skillProgress) do
-        tes3mp.SetSkillProgress(self.pid, tes3mp.GetSkillId(name), value)
-    end
-
-    for name, value in pairs(self.data.attributeSkillIncreases) do
-        tes3mp.SetSkillIncrease(self.pid, tes3mp.GetAttributeId(name), value)
-    end
-
-    tes3mp.SetLevelProgress(self.pid, self.data.stats.levelProgress)
     tes3mp.SendSkills(self.pid)
 end
 
 function BasePlayer:SaveSkills()
+
     for name in pairs(self.data.skills) do
+
         local skillId = tes3mp.GetSkillId(name)
-        self.data.skills[name] = tes3mp.GetSkillBase(self.pid, skillId)
-        self.data.skillProgress[name] = tes3mp.GetSkillProgress(self.pid, skillId)
+
+        local baseValue = tes3mp.GetSkillBase(self.pid, skillId)
+        local modifierValue = tes3mp.GetSkillModifier(self.pid, skillId)
+        local maxSkillValue = config.maxSkillValue
+
+        if name == "Acrobatics" then
+            maxSkillValue = config.maxAcrobaticsValue
+        end
+
+        if baseValue > maxSkillValue then
+            self:LoadSkills()
+
+            local message = "Your base " .. name .. " has exceeded the maximum allowed value " ..
+                "and been reset to its last recorded one.\n"
+            tes3mp.SendMessage(self.pid, message)
+        elseif (baseValue + modifierValue) > maxSkillValue and not config.ignoreModifierWithMaxSkill then
+            tes3mp.ClearSkillModifier(self.pid, skillId)
+            tes3mp.SendSkills(self.pid)
+
+            local message = "Your " .. name .. " fortification has exceeded the maximum allowed " ..
+                "value and been removed.\n"
+            tes3mp.SendMessage(self.pid, message)
+        else
+            self.data.skills[name] = {
+                base = baseValue,
+                damage = tes3mp.GetSkillDamage(self.pid, skillId),
+                progress = tes3mp.GetSkillProgress(self.pid, skillId)
+            }
+
+            -- Removes old tables for skill progress
+            if self.data.skillProgress ~= nil and self.data.skillProgress[name] ~= nil then
+                self.data.skillProgress[name] = nil
+            end
+        end
     end
 
-    for name in pairs(self.data.attributeSkillIncreases) do
-        local attributeId = tes3mp.GetAttributeId(name)
-        self.data.attributeSkillIncreases[name] = tes3mp.GetSkillIncrease(self.pid, attributeId)
+    -- Remove traces of old way of saving skill progress
+    if self.data.skillProgress ~= nil and tableHelper.isEmpty(self.data.skillProgress) then
+        self.data.skillProgress = nil
     end
-
-    self.data.stats.levelProgress = tes3mp.GetLevelProgress(self.pid)
 end
 
 function BasePlayer:LoadLevel()
+
+    if self.data.stats.level == nil then self.data.stats.level = 1 end
+    if self.data.stats.levelProgress == nil then self.data.stats.levelProgress = 0 end
+
     tes3mp.SetLevel(self.pid, self.data.stats.level)
+    tes3mp.SetLevelProgress(self.pid, self.data.stats.levelProgress)
     tes3mp.SendLevel(self.pid)
 end
 
 function BasePlayer:SaveLevel()
     self.data.stats.level = tes3mp.GetLevel(self.pid)
-end
-
-function BasePlayer:LoadBounty()
-    tes3mp.SetBounty(self.pid, self.data.stats.bounty)
-    tes3mp.SendBounty(self.pid)
-end
-
-function BasePlayer:SaveBounty()
-    self.data.stats.bounty = tes3mp.GetBounty(self.pid)
+    self.data.stats.levelProgress = tes3mp.GetLevelProgress(self.pid)
 end
 
 function BasePlayer:LoadShapeshift()
 
-    if self.data.shapeshift == nil then
-        self.data.shapeshift = {}
-    end
+    if self.data.shapeshift == nil then self.data.shapeshift = {} end
+    if self.data.shapeshift.scale == nil then self.data.shapeshift.scale = 1 end
+    if self.data.shapeshift.isWerewolf == nil then self.data.shapeshift.isWerewolf = false end
+    if self.data.shapeshift.creatureRefId == nil then self.data.shapeshift.creatureRefId = "" end
+    if self.data.shapeshift.displayCreatureName == nil then self.data.shapeshift.displayCreatureName = false end
 
-    if self.data.shapeshift.isWerewolf == true then
-        tes3mp.SetWerewolfState(self.pid, true)
-        tes3mp.SendShapeshift(self.pid)
-    end
+    tes3mp.SetScale(self.pid, self.data.shapeshift.scale)
+    tes3mp.SetWerewolfState(self.pid, self.data.shapeshift.isWerewolf)
+    tes3mp.SetCreatureRefId(self.pid, self.data.shapeshift.creatureRefId)
+    tes3mp.SetCreatureNameDisplayState(self.pid, self.data.shapeshift.displayCreatureName)
+    tes3mp.SendShapeshift(self.pid)
 end
 
 function BasePlayer:SaveShapeshift()
 
-    if self.data.shapeshift == nil then
-        self.data.shapeshift = {}
+    if self.data.shapeshift == nil then self.data.shapeshift = {} end
+
+    local newScale = tes3mp.GetScale(self.pid)
+
+    if newScale ~= self.data.shapeshift.scale then
+        tes3mp.LogMessage(enumerations.log.INFO, "Player " .. logicHandler.GetChatName(self.pid) ..
+            " has changed their scale to " .. newScale)
+        self.data.shapeshift.scale = newScale
     end
 
     self.data.shapeshift.isWerewolf = tes3mp.IsWerewolf(self.pid)
 end
 
 function BasePlayer:LoadCell()
-    local newCell = self.data.location.cell
 
-    if newCell ~= nil then
+    if self.data.location ~= nil then
+        local newCell = self.data.location.cell
 
-        tes3mp.SetCell(self.pid, newCell)
+        if newCell ~= nil then
 
-        local pos = {0, 0, 0}
-        local rot = {0, 0}
-        pos[0] = self.data.location.posX
-        pos[1] = self.data.location.posY
-        pos[2] = self.data.location.posZ
-        rot[0] = self.data.location.rotX
-        rot[1] = self.data.location.rotZ
+            tes3mp.SetCell(self.pid, newCell)
 
-        tes3mp.SetPos(self.pid, pos[0], pos[1], pos[2])
-        tes3mp.SetRot(self.pid, rot[0], rot[1])
+            local pos = {0, 0, 0}
+            local rot = {0, 0}
+            pos[0] = self.data.location.posX
+            pos[1] = self.data.location.posY
+            pos[2] = self.data.location.posZ
+            rot[0] = self.data.location.rotX
+            rot[1] = self.data.location.rotZ
 
-        tes3mp.SendCell(self.pid)
-        tes3mp.SendPos(self.pid)
-    end
-end
+            if pos[0] ~= nil and pos[1] ~= nil and pos[2] ~= nil then
+                tes3mp.SetPos(self.pid, pos[0], pos[1], pos[2])
+            end
 
-function BasePlayer:SaveCell()
+            if rot[0] ~= nil and rot[1] ~= nil then
+                tes3mp.SetRot(self.pid, rot[0], rot[1])
+            end
 
-    -- Keep this around to update old player files
-    if self.data.mapExplored == nil then
-        self.data.mapExplored = {}
-    end
+            tes3mp.SendCell(self.pid)
+            tes3mp.SendPos(self.pid)
 
-    local cell = tes3mp.GetCell(self.pid)
+            local regionName = self.data.location.regionName
 
-    if cell == "Seyda Neen, Census and Excise Office" then
-        self:LoadCell()
-        tes3mp.MessageBox(self.pid, -1, "The default character generation is not compatible with multiplayer.")
-    else
-        self.data.location.cell = cell
-        self.data.location.posX = tes3mp.GetPosX(self.pid)
-        self.data.location.posY = tes3mp.GetPosY(self.pid)
-        self.data.location.posZ = tes3mp.GetPosZ(self.pid)
-        self.data.location.rotX = tes3mp.GetRotX(self.pid)
-        self.data.location.rotZ = tes3mp.GetRotZ(self.pid)
-
-        if tes3mp.IsInExterior(self.pid) == true then
-
-            if tableHelper.containsValue(self.data.mapExplored, cell) == false then
-                table.insert(self.data.mapExplored, cell)
+            if regionName ~= nil then
+                logicHandler.LoadRegionForPlayer(self.pid, regionName, true)
             end
         end
     end
 end
 
+function BasePlayer:SaveCell()
+
+    if self.data.location == nil then self.data.location = {} end
+
+    -- Keep this around to update old player files
+    if self.data.mapExplored == nil then self.data.mapExplored = {} end
+
+    local cell = tes3mp.GetCell(self.pid)
+
+    self.data.location.cell = cell
+    self.data.location.posX = tes3mp.GetPosX(self.pid)
+    self.data.location.posY = tes3mp.GetPosY(self.pid)
+    self.data.location.posZ = tes3mp.GetPosZ(self.pid)
+    self.data.location.rotX = tes3mp.GetRotX(self.pid)
+    self.data.location.rotZ = tes3mp.GetRotZ(self.pid)
+
+    stateHelper:SaveMapExploration(self.pid, self)
+end
+
 function BasePlayer:LoadEquipment()
 
-    for i = 0, tes3mp.GetEquipmentSize() - 1 do
+    for index = 0, tes3mp.GetEquipmentSize() - 1 do
 
-        local currentItem = self.data.equipment[i]
+        local currentItem = self.data.equipment[index]
 
         if currentItem ~= nil then
-            tes3mp.EquipItem(self.pid, i, currentItem.refId, currentItem.count, currentItem.charge)
+            if currentItem.enchantmentCharge == nil then
+                currentItem.enchantmentCharge = -1
+            end
+
+            tes3mp.EquipItem(self.pid, index, currentItem.refId, currentItem.count,
+                currentItem.charge, currentItem.enchantmentCharge)
         else
-            tes3mp.UnequipItem(self.pid, i)
+            tes3mp.UnequipItem(self.pid, index)
         end
     end
 
@@ -634,35 +959,89 @@ end
 
 function BasePlayer:SaveEquipment()
 
+    local reloadAtEnd = false
+
     self.data.equipment = {}
 
-    for i = 0, tes3mp.GetEquipmentSize() - 1 do
-        local itemRefId = tes3mp.GetEquipmentItemRefId(self.pid, i)
+    for index = 0, tes3mp.GetEquipmentSize() - 1 do
+        local itemRefId = tes3mp.GetEquipmentItemRefId(self.pid, index)
 
         if itemRefId ~= "" then
-            self.data.equipment[i] = {
-                refId = itemRefId,
-                count = tes3mp.GetEquipmentItemCount(self.pid, i),
-                charge = tes3mp.GetEquipmentItemCharge(self.pid, i)
-            }
+            if tableHelper.containsValue(config.bannedEquipmentItems, itemRefId) then
+                self:Message("You have tried wearing an item that isn't allowed!\n")
+                reloadAtEnd = true
+            else
+                self.data.equipment[index] = {
+                    refId = itemRefId,
+                    count = tes3mp.GetEquipmentItemCount(self.pid, index),
+                    charge = tes3mp.GetEquipmentItemCharge(self.pid, index),
+                    enchantmentCharge = tes3mp.GetEquipmentItemEnchantmentCharge(self.pid, index)
+                }
+            end
         end
     end
+
+    if reloadAtEnd then
+        self:LoadEquipment()
+    end
+end
+
+-- Iterate through inventory items and remove nil values as well as items whose
+-- records no longer exist
+-- Note: The check for existing records can only handle generated records for now
+function BasePlayer:CleanInventory()
+
+    for index, currentItem in pairs(self.data.inventory) do
+
+        if logicHandler.IsGeneratedRecord(currentItem.refId) then
+
+            local recordStore = logicHandler.GetRecordStoreByRecordId(currentItem.refId)
+
+            if recordStore == nil or recordStore.data.generatedRecords[currentItem.refId] == nil then
+                self.data.inventory[index] = nil
+            end
+        end
+    end
+
+    if not tableHelper.isArray(self.data.inventory) then
+        tableHelper.cleanNils(self.data.inventory)
+    end
+end
+
+-- Send a packet with some specific item changes to the player, to avoid having
+-- to resend the entire inventory
+--
+-- Note: This just sends a packet, so the same item changes should be applied to
+--       self.data.inventory separately
+function BasePlayer:LoadItemChanges(itemArray, inventoryAction)
+
+    tes3mp.ClearInventoryChanges(self.pid)
+    tes3mp.SetInventoryChangesAction(self.pid, inventoryAction)
+
+    for index, currentItem in pairs(itemArray) do
+
+        if currentItem.count > 0 then
+            packetBuilder.AddPlayerInventoryItemChange(self.pid, currentItem)
+        end
+    end
+
+    tes3mp.SendInventoryChanges(self.pid)
 end
 
 function BasePlayer:LoadInventory()
 
-    if self.data.inventory == nil then
-        self.data.inventory = {}
-    end
+    if self.data.inventory == nil then self.data.inventory = {} end
 
-    -- Send an empty initialized inventory to clear the player's existing items
-    tes3mp.InitializeInventoryChanges(self.pid)
-    tes3mp.SendInventoryChanges(self.pid)
+    tes3mp.ClearInventoryChanges(self.pid)
+    tes3mp.SetInventoryChangesAction(self.pid, enumerations.inventory.SET)
 
     for index, currentItem in pairs(self.data.inventory) do
 
-        if currentItem ~= nil then
-            tes3mp.AddItem(self.pid, currentItem.refId, currentItem.count, currentItem.charge)
+        if currentItem.count ~= nil and currentItem.count > 0 then
+            packetBuilder.AddPlayerInventoryItemChange(self.pid, currentItem)
+        else
+            tes3mp.LogMessage(enumerations.log.INFO, "Caught nil or empty item in inventory for player " .. self.name .. " with item " .. tostring(currentItem) .. ", purging from data store.")
+            self.data.inventory[index] = nil
         end
     end
 
@@ -671,159 +1050,247 @@ end
 
 function BasePlayer:SaveInventory()
 
-    self.data.inventory = {}
+    local action = tes3mp.GetInventoryChangesAction(self.pid)
+    local itemChangesCount = tes3mp.GetInventoryChangesSize(self.pid)
 
-    for i = 0, tes3mp.GetInventoryChangesSize(self.pid) - 1 do
-        local itemRefId = tes3mp.GetInventoryItemRefId(self.pid, i)
+    tes3mp.LogMessage(enumerations.log.INFO, "Saving " .. itemChangesCount .. " item(s) to inventory with action " ..
+        tableHelper.getIndexByValue(enumerations.inventory, action))
+
+    if action == enumerations.inventory.SET then self.data.inventory = {} end
+
+    for index = 0, itemChangesCount - 1 do
+        local itemRefId = tes3mp.GetInventoryItemRefId(self.pid, index)
 
         if itemRefId ~= "" then
-            self.data.inventory[i] = {
+
+            local item = {
                 refId = itemRefId,
-                count = tes3mp.GetInventoryItemCount(self.pid, i),
-                charge = tes3mp.GetInventoryItemCharge(self.pid, i)
+                count = tes3mp.GetInventoryItemCount(self.pid, index),
+                charge = tes3mp.GetInventoryItemCharge(self.pid, index),
+                enchantmentCharge = tes3mp.GetInventoryItemEnchantmentCharge(self.pid, index),
+                soul = tes3mp.GetInventoryItemSoul(self.pid, index)
             }
+
+            tes3mp.LogAppend(enumerations.log.INFO, "- id: " .. item.refId .. ", count: " .. item.count ..
+                ", charge: " .. item.charge .. ", enchantmentCharge: " .. item.enchantmentCharge ..
+                ", soul: " .. item.soul)
+
+            if action == enumerations.inventory.SET or action == enumerations.inventory.ADD then
+
+                inventoryHelper.addItem(self.data.inventory, item.refId, item.count, item.charge,
+                    item.enchantmentCharge, item.soul)
+
+                if logicHandler.IsGeneratedRecord(item.refId) then
+
+                    local recordStore = logicHandler.GetRecordStoreByRecordId(item.refId)
+
+                    if recordStore ~= nil then
+                        self:AddLinkToRecord(recordStore.storeType, item.refId)
+                    end
+                end
+
+            elseif action == enumerations.inventory.REMOVE then
+
+                inventoryHelper.removeClosestItem(self.data.inventory, item.refId, item.count,
+                    item.charge, item.enchantmentCharge, item.soul)
+
+                if not inventoryHelper.containsItem(self.data.inventory, item.refId) and
+                    logicHandler.IsGeneratedRecord(item.refId) then
+
+                    local recordStore = logicHandler.GetRecordStoreByRecordId(item.refId)
+
+                    if recordStore ~= nil then
+                        self:RemoveLinkToRecord(recordStore.storeType, item.refId)
+                    end
+                end
+            end
         end
+    end
+
+    self:QuicksaveToDrive()
+end
+
+-- Iterate through spells and remove nil values as well as spells whose records
+-- no longer exist
+-- Note: The check for existing records can only handle generated records for now
+function BasePlayer:CleanSpellbook()
+
+    local recordStore = RecordStores["spell"]
+
+    for index, spellId in pairs(self.data.spellbook) do
+
+        -- Make sure we skip over old spell tables from previous versions of TES3MP
+        if type(spellId) ~= "table" and logicHandler.IsGeneratedRecord(spellId) then
+
+            if recordStore.data.generatedRecords[spellId] == nil then
+                self.data.spellbook[index] = nil
+            end
+        end
+    end
+
+    if not tableHelper.isArray(self.data.spellbook) then
+        tableHelper.cleanNils(self.data.spellbook)
     end
 end
 
 function BasePlayer:LoadSpellbook()
 
-    if self.data.spellbook == nil then
-        self.data.spellbook = {}
-    end
+    if self.data.spellbook == nil then self.data.spellbook = {} end
 
-    tes3mp.InitializeSpellbookChanges(self.pid)
-    tes3mp.SetSpellbookChangesAction(self.pid, actionTypes.spellbook.SET)
+    tes3mp.ClearSpellbookChanges(self.pid)
+    tes3mp.SetSpellbookChangesAction(self.pid, enumerations.spellbook.SET)
 
-    for index, currentSpell in pairs(self.data.spellbook) do
+    for index, spellId in pairs(self.data.spellbook) do
 
-        if currentSpell ~= nil then
-            if string.find(currentSpell.spellId, "$dynamic") then
-                tes3mp.AddCustomSpell(self.pid, currentSpell.spellId, currentSpell.name)
-                tes3mp.AddCustomSpellData(self.pid, currentSpell.spellId, currentSpell.data.type, currentSpell.data.cost, currentSpell.data.flags)
-                for effectIndex, effect in pairs(currentSpell.effects) do
-                    tes3mp.AddCustomSpellEffect(self.pid, currentSpell.spellId, effect.effectId, effect.skill, effect.attribute, effect.range, effect.area, effect.duration, effect.magnMin, effect.magnMax)
-                end
-            else
-                tes3mp.AddSpell(self.pid, currentSpell.spellId)
-            end
+        -- Is this an old spell table from a previous version of TES3MP?
+        -- If so, update it to the new format
+        if type(spellId) == "table" then
+            spellId = spellId.spellId
+            self.data.spellbook[index] = spellId
         end
+
+        tes3mp.AddSpell(self.pid, spellId)
     end
 
     tes3mp.SendSpellbookChanges(self.pid)
 end
 
-function BasePlayer:AddSpells()
+function BasePlayer:SaveSpellbook()
 
-    for i = 0, tes3mp.GetSpellbookChangesSize(self.pid) - 1 do
-        local spellId = tes3mp.GetSpellId(self.pid, i)
+    local action = tes3mp.GetSpellbookChangesAction(self.pid)
 
-        -- Only add new spell if we don't already have it
-        if tableHelper.containsKeyValue(self.data.spellbook, "spellId", spellId, true) == false then
-            tes3mp.LogMessage(1, "Adding spell " .. spellId .. " to " .. tes3mp.GetName(self.pid))
-            local newSpell = {}
-            newSpell.spellId = spellId
+    if action == enumerations.spellbook.SET then
+        self.data.spellbook = {}
+    end
 
-            if string.find(spellId, "$dynamic") then
-                newSpell.name = tes3mp.GetSpellName(self.pid, i)
+    for index = 0, tes3mp.GetSpellbookChangesSize(self.pid) - 1 do
+        local spellId = tes3mp.GetSpellId(self.pid, index)
 
-                newSpell.data = {}
-                newSpell.data.type = tes3mp.GetSpellType(self.pid, i)
-                newSpell.data.cost = tes3mp.GetSpellCost(self.pid, i)
-                newSpell.data.flags = tes3mp.GetSpellFlags(self.pid, i)
+        if action == enumerations.spellbook.SET or action == enumerations.spellbook.ADD then
+            -- Only add new spell if we don't already have it
+            if not tableHelper.containsValue(self.data.spellbook, spellId) then
+                tes3mp.LogMessage(enumerations.log.INFO, "Adding spell " .. spellId .. " to " ..
+                    logicHandler.GetChatName(self.pid))
+                table.insert(self.data.spellbook, spellId)
+            end
+        elseif action == enumerations.spellbook.REMOVE then
+            -- Only print spell removal if the spell actually exists
+            if tableHelper.containsValue(self.data.spellbook, spellId) == true then
+                tes3mp.LogMessage(enumerations.log.INFO, "Removing spell " .. spellId .. " from " ..
+                    logicHandler.GetChatName(self.pid))
+                local foundIndex = tableHelper.getIndexByValue(self.data.spellbook, spellId)
+                self.data.spellbook[foundIndex] = nil
 
-                newSpell.effects = {}
-                
-                for j = 0, tes3mp.GetSpellEffectCount(self.pid, i) - 1 do
-                    local newEffect = {}
+                if logicHandler.IsGeneratedRecord(spellId) then
+                    local recordStore = RecordStores["spell"]
 
-                    newEffect.effectId = tes3mp.GetSpellEffectId(self.pid, i, j)
-                    newEffect.skill = tes3mp.GetSpellEffectSkill(self.pid, i, j)
-                    newEffect.attribute = tes3mp.GetSpellEffectAttribute(self.pid, i, j)
-                    newEffect.range = tes3mp.GetSpellEffectRange(self.pid, i, j)
-                    newEffect.area = tes3mp.GetSpellEffectArea(self.pid, i, j)
-                    newEffect.duration = tes3mp.GetSpellEffectDuration(self.pid, i, j)
-                    newEffect.magnMin = tes3mp.GetSpellEffectMagnMin(self.pid, i, j)
-                    newEffect.magnMax = tes3mp.GetSpellEffectMagnMax(self.pid, i, j)
-
-                    table.insert(newSpell.effects, newEffect)
+                    if recordStore ~= nil then
+                        self:RemoveLinkToRecord(recordStore.storeType, spellId)
+                    end
                 end
             end
-
-            table.insert(self.data.spellbook, newSpell)
-        end
-    end
-end
-
-function BasePlayer:RemoveSpells()
-
-    for i = 0, tes3mp.GetSpellbookChangesSize(self.pid) - 1 do
-        local spellId = tes3mp.GetSpellId(self.pid, i)
-
-        -- Only print spell removal if the spell actually exists
-        if tableHelper.containsKeyValue(self.data.spellbook, "spellId", spellId, true) == true then
-            tes3mp.LogMessage(1, "Removing spell " .. spellId .. " from " .. tes3mp.GetName(self.pid))
-            local foundIndex = tableHelper.getIndexByNestedKeyValue(self.data.spellbook, "spellId", spellId)
-            self.data.spellbook[foundIndex] = nil
         end
     end
 
-    tableHelper.cleanNils(self.data.spellbook)
+    if action == enumerations.spellbook.REMOVE then
+        tableHelper.cleanNils(self.data.spellbook)
+    end
 end
 
-function BasePlayer:SetSpells()
+function BasePlayer:LoadQuickKeys()
 
-    self.data.spellbook = {}
-    self:AddSpells()
+    if self.data.quickKeys == nil then self.data.quickKeys = {} end
+
+    tes3mp.ClearQuickKeyChanges(self.pid)
+
+    for slot, currentQuickKey in pairs(self.data.quickKeys) do
+
+        if currentQuickKey ~= nil then
+            tes3mp.AddQuickKey(self.pid, slot, currentQuickKey.keyType, currentQuickKey.itemId)
+        end
+    end
+
+    tes3mp.SendQuickKeyChanges(self.pid)
 end
 
-function BasePlayer:SaveJournal()
-    stateHelper:SaveJournal(self.pid, self)
+function BasePlayer:SaveQuickKeys()
+
+    for index = 0, tes3mp.GetQuickKeyChangesSize(self.pid) - 1 do
+
+        local slot = tes3mp.GetQuickKeySlot(self.pid, index)
+
+        self.data.quickKeys[slot] = {
+            keyType = tes3mp.GetQuickKeyType(self.pid, index),
+            itemId = tes3mp.GetQuickKeyItemId(self.pid, index)
+        }
+    end
 end
 
 function BasePlayer:LoadJournal()
     stateHelper:LoadJournal(self.pid, self)
 end
 
-function BasePlayer:SaveFactionRanks()
-    stateHelper:SaveFactionRanks(self.pid, self)
+function BasePlayer:SaveJournal()
+    stateHelper:SaveJournal(self.pid, self)
 end
 
 function BasePlayer:LoadFactionRanks()
     stateHelper:LoadFactionRanks(self.pid, self)
 end
 
-function BasePlayer:SaveFactionExpulsion()
-    stateHelper:SaveFactionExpulsion(self.pid, self)
+function BasePlayer:SaveFactionRanks()
+    stateHelper:SaveFactionRanks(self.pid, self)
 end
 
 function BasePlayer:LoadFactionExpulsion()
     stateHelper:LoadFactionExpulsion(self.pid, self)
 end
 
-function BasePlayer:SaveFactionReputation()
-    stateHelper:SaveFactionReputation(self.pid, self)
+function BasePlayer:SaveFactionExpulsion()
+    stateHelper:SaveFactionExpulsion(self.pid, self)
 end
 
 function BasePlayer:LoadFactionReputation()
     stateHelper:LoadFactionReputation(self.pid, self)
 end
 
-function BasePlayer:SaveTopics()
-    stateHelper:SaveTopics(self.pid, self)
+function BasePlayer:SaveFactionReputation()
+    stateHelper:SaveFactionReputation(self.pid, self)
 end
 
 function BasePlayer:LoadTopics()
     stateHelper:LoadTopics(self.pid, self)
 end
 
+function BasePlayer:SaveTopics()
+    stateHelper:SaveTopics(self.pid, self)
+end
+
+function BasePlayer:LoadBounty()
+    stateHelper:LoadBounty(self.pid, self)
+end
+
+function BasePlayer:SaveBounty()
+    stateHelper:SaveBounty(self.pid, self)
+end
+
+function BasePlayer:LoadReputation()
+    stateHelper:LoadReputation(self.pid, self)
+end
+
+function BasePlayer:SaveReputation()
+    stateHelper:SaveReputation(self.pid, self)
+end
+
+function BasePlayer:LoadMap()
+    stateHelper:LoadMap(self.pid, self)
+end
+
 function BasePlayer:LoadBooks()
 
-    if self.data.books == nil then
-        self.data.books = {}
-    end
+    if self.data.books == nil then self.data.books = {} end
 
-    tes3mp.InitializeBookChanges(self.pid)
+    tes3mp.ClearBookChanges(self.pid)
 
     for index, bookId in pairs(self.data.books) do
 
@@ -835,50 +1302,90 @@ end
 
 function BasePlayer:AddBooks()
 
-    for i = 0, tes3mp.GetBookChangesSize(self.pid) - 1 do
-        local bookId = tes3mp.GetBookId(self.pid, i)
+    for index = 0, tes3mp.GetBookChangesSize(self.pid) - 1 do
+        local bookId = tes3mp.GetBookId(self.pid, index)
 
         -- Only add new book if we don't already have it
-        if tableHelper.containsValue(self.data.books, bookId, false) == false then
-            tes3mp.LogMessage(1, "Adding book " .. bookId .. " to " .. tes3mp.GetName(self.pid))
+        if not tableHelper.containsValue(self.data.books, bookId, false) then
+            tes3mp.LogMessage(enumerations.log.INFO, "Adding book " .. bookId .. " to " ..
+                logicHandler.GetChatName(self.pid))
             table.insert(self.data.books, bookId)
         end
     end
 end
 
-function BasePlayer:LoadMap()
+function BasePlayer:LoadMarkLocation()
 
-    if self.data.mapExplored == nil then
-        self.data.mapExplored = {}
+    if self.data.miscellaneous == nil then self.data.miscellaneous = {} end
+
+    if self.data.miscellaneous.markLocation ~= nil then
+        local markLocation = self.data.miscellaneous.markLocation
+        tes3mp.SetMarkCell(self.pid, markLocation.cell)
+        tes3mp.SetMarkPos(self.pid, markLocation.posX, markLocation.posY, markLocation.posZ)
+        tes3mp.SetMarkRot(self.pid, markLocation.rotX, markLocation.rotZ)
+        tes3mp.SendMarkLocation(self.pid)
     end
-
-    tes3mp.InitializeMapChanges(self.pid)
-
-    for index, cellDescription in pairs(self.data.mapExplored) do
-
-        tes3mp.AddCellExplored(self.pid, cellDescription)
-    end
-
-    tes3mp.SendMapChanges(self.pid)
 end
 
-function BasePlayer:GetConsole(state)
-    return self.data.settings.consoleAllowed
+function BasePlayer:SaveMarkLocation()
+
+    if self.data.miscellaneous == nil then self.data.miscellaneous = {} end
+
+    self.data.miscellaneous.markLocation = {
+        cell = tes3mp.GetMarkCell(self.pid),
+        posX = tes3mp.GetMarkPosX(self.pid),
+        posY = tes3mp.GetMarkPosY(self.pid),
+        posZ = tes3mp.GetMarkPosZ(self.pid),
+        rotX = tes3mp.GetMarkRotX(self.pid),
+        rotZ = tes3mp.GetMarkRotZ(self.pid)
+    }
 end
 
-function BasePlayer:GetDifficulty(state)
+function BasePlayer:LoadSelectedSpell()
+
+    if self.data.miscellaneous == nil then
+        self.data.miscellaneous = {}
+    end
+
+    if self.data.miscellaneous.selectedSpell ~= nil then
+        tes3mp.SetSelectedSpellId(self.pid, self.data.miscellaneous.selectedSpell)
+        tes3mp.SendSelectedSpell(self.pid)
+    end
+end
+
+function BasePlayer:SaveSelectedSpell()
+
+    if self.data.miscellaneous == nil then self.data.miscellaneous = {} end
+
+    self.data.miscellaneous.selectedSpell = tes3mp.GetSelectedSpellId(self.pid)
+end
+
+function BasePlayer:GetDifficulty()
     return self.data.settings.difficulty
 end
 
-function BasePlayer:SetConsole(state)
-    if state == nil or state == "default" then
-        state = config.allowConsole
-        self.data.settings.consoleAllowed = "default"
-    else
-        self.data.settings.consoleAllowed = state
-    end
+function BasePlayer:GetConsoleAllowed()
+    return self.data.settings.consoleAllowed
+end
 
-    tes3mp.SetConsoleAllow(self.pid, state)
+function BasePlayer:GetBedRestAllowed()
+    return self.data.settings.bedRestAllowed
+end
+
+function BasePlayer:GetWildernessRestAllowed()
+    return self.data.settings.wildernessRestAllowed
+end
+
+function BasePlayer:GetWaitAllowed()
+    return self.data.settings.waitAllowed
+end
+
+function BasePlayer:GetEnforcedLogLevel()
+    return self.data.settings.enforcedLogLevel
+end
+
+function BasePlayer:GetPhysicsFramerate()
+    return self.data.settings.physicsFramerate
 end
 
 function BasePlayer:SetDifficulty(difficulty)
@@ -890,7 +1397,78 @@ function BasePlayer:SetDifficulty(difficulty)
     end
 
     tes3mp.SetDifficulty(self.pid, difficulty)
-    tes3mp.LogMessage(3, "Set difficulty to " .. tostring(difficulty) .. " for " .. self.pid)
+    tes3mp.LogMessage(enumerations.log.INFO, "Set difficulty to " .. tostring(difficulty) .. " for " ..
+        logicHandler.GetChatName(self.pid))
+end
+
+function BasePlayer:SetEnforcedLogLevel(enforcedLogLevel)
+    if enforcedLogLevel == nil or enforcedLogLevel == "default" then
+        enforcedLogLevel = config.enforcedLogLevel
+        self.data.settings.enforcedLogLevel = "default"
+    else
+        self.data.settings.enforcedLogLevel = enforcedLogLevel
+    end
+
+    tes3mp.SetEnforcedLogLevel(self.pid, enforcedLogLevel)
+    tes3mp.LogMessage(enumerations.log.INFO, "Set enforced log level to " .. tostring(enforcedLogLevel) ..
+        " for " .. logicHandler.GetChatName(self.pid))
+end
+
+function BasePlayer:SetPhysicsFramerate(physicsFramerate)
+    if physicsFramerate == nil or physicsFramerate == "default" then
+        physicsFramerate = config.physicsFramerate
+        self.data.settings.physicsFramerate = "default"
+    else
+        self.data.settings.physicsFramerate = physicsFramerate
+    end
+
+    tes3mp.SetPhysicsFramerate(self.pid, physicsFramerate)
+    tes3mp.LogMessage(enumerations.log.INFO, "Set physics framerate to " .. tostring(physicsFramerate) ..
+        " for " .. logicHandler.GetChatName(self.pid))
+end
+
+function BasePlayer:SetConsoleAllowed(state)
+    if state == nil or state == "default" then
+        state = config.allowConsole
+        self.data.settings.consoleAllowed = "default"
+    else
+        self.data.settings.consoleAllowed = state
+    end
+
+    tes3mp.SetConsoleAllowed(self.pid, state)
+end
+
+function BasePlayer:SetBedRestAllowed(state)
+    if state == nil or state == "default" then
+        state = config.allowBedRest
+        self.data.settings.bedRestAllowed = "default"
+    else
+        self.data.settings.bedRestAllowed = state
+    end
+
+    tes3mp.SetBedRestAllowed(self.pid, state)
+end
+
+function BasePlayer:SetWildernessRestAllowed(state)
+    if state == nil or state == "default" then
+        state = config.allowWildernessRest
+        self.data.settings.wildernessRestAllowed = "default"
+    else
+        self.data.settings.wildernessRestAllowed = state
+    end
+
+    tes3mp.SetWildernessRestAllowed(self.pid, state)
+end
+
+function BasePlayer:SetWaitAllowed(state)
+    if state == nil or state == "default" then
+        state = config.allowWait
+        self.data.settings.waitAllowed = "default"
+    else
+        self.data.settings.waitAllowed = state
+    end
+
+    tes3mp.SetWaitAllowed(self.pid, state)
 end
 
 function BasePlayer:SetWerewolfState(state)
@@ -900,18 +1478,62 @@ function BasePlayer:SetWerewolfState(state)
     tes3mp.SendShapeshift(self.pid)
 end
 
+function BasePlayer:SetScale(scale)
+    self.data.shapeshift.scale = scale
+
+    tes3mp.SetScale(self.pid, scale)
+    tes3mp.SendShapeshift(self.pid)
+end
+
+function BasePlayer:SetConfiscationState(state)
+
+    self.data.customVariables.isConfiscationTarget = state
+
+    if self:IsLoggedIn() then
+
+        if state == true then
+            logicHandler.RunConsoleCommandOnPlayer(self.pid, "tm")
+            logicHandler.RunConsoleCommandOnPlayer(self.pid, "disableplayercontrols")
+            tes3mp.MessageBox(self.pid, -1, "You are immobilized while an item is being confiscated from you")
+        elseif not state then
+            self.data.customVariables.isConfiscationTarget = nil
+            logicHandler.RunConsoleCommandOnPlayer(self.pid, "tm")
+            logicHandler.RunConsoleCommandOnPlayer(self.pid, "enableplayercontrols")
+            tes3mp.MessageBox(self.pid, -1, "You are free to move again")
+        end
+    end
+end
+
 function BasePlayer:LoadSettings()
 
-    self:SetConsole(self.data.settings.consoleAllowed)
+    -- Change admin variable from old player files to the current staffRank
+    if self.data.settings.staffRank == nil and self.data.settings.admin ~= nil then
+        self.data.settings.staffRank = self.data.settings.admin
+        self.data.settings.admin = nil
+    end
+
     self:SetDifficulty(self.data.settings.difficulty)
+    self:SetConsoleAllowed(self.data.settings.consoleAllowed)
+    self:SetBedRestAllowed(self.data.settings.bedRestAllowed)
+    self:SetWildernessRestAllowed(self.data.settings.wildernessRestAllowed)
+    self:SetWaitAllowed(self.data.settings.waitAllowed)
+    self:SetEnforcedLogLevel(self.data.settings.enforcedLogLevel)
+    self:SetPhysicsFramerate(self.data.settings.physicsFramerate)
 
     tes3mp.SendSettings(self.pid)
+end
+
+function BasePlayer:LoadSpecialStates()
+
+    if self.data.customVariables.isConfiscationTarget ~= nil then
+        self:SetConfiscationState(self.data.customVariables.isConfiscationTarget)
+    end
 end
 
 function BasePlayer:AddCellLoaded(cellDescription)
 
     -- Only add new loaded cell if we don't already have it
-    if tableHelper.containsValue(self.cellsLoaded, cellDescription) == false then
+    if not tableHelper.containsValue(self.cellsLoaded, cellDescription) then
         table.insert(self.cellsLoaded, cellDescription)
     end
 end
