@@ -145,7 +145,7 @@ logicHandler.IsPlayerAllowedConsole = function(pid)
 
     if player ~= nil and player:IsLoggedIn() then
 
-        if player:IsAdmin() or player.data.settings.consoleAllowed == true then
+        if player:IsAdmin() or player.data.settings.consoleAllowed then
             return true
         elseif player.data.settings.consoleAllowed == "default" and config.allowConsole then
             return true
@@ -177,16 +177,11 @@ logicHandler.GetPlayerByName = function(targetName)
 end
 
 logicHandler.BanPlayer = function(pid, targetName)
-
-    -- Ban players based on their account names, i.e. based on the filenames used for their JSON files that
-    -- have had invalid characters replaced
-    local accountName = fileHelper.fixFilename(targetName)
-
-    if not tableHelper.containsValue(banList.playerNames, string.lower(accountName)) then
+    if not tableHelper.containsValue(banList.playerNames, string.lower(targetName)) then
         local targetPlayer = logicHandler.GetPlayerByName(targetName)
 
         if targetPlayer ~= nil then
-            table.insert(banList.playerNames, string.lower(accountName))
+            table.insert(banList.playerNames, string.lower(targetName))
             SaveBanList()
 
             tes3mp.SendMessage(pid, "All IP addresses stored for " .. targetName ..
@@ -320,24 +315,18 @@ logicHandler.PushPlayerList = function(pls)
 end
 
 logicHandler.AuthCheck = function(pid)
-    if Players[pid] ~= nil then
-        if Players[pid]:IsLoggedIn() then
-            return true
-        end
-
-        local playerName = logicHandler.GetChatName(pid)
-
-        local message = playerName .. " failed to log in.\n"
-        tes3mp.SendMessage(pid, message, true)
-        Players[pid]:Kick()
-
-        Players[pid] = nil
-        return false
-    else
-        tes3mp.LogMessage(enumerations.log.INFO, "Player with pid " .. pid .. " does not exist but auth check was called with" ..
-            " pid.")
-        return false
+    if Players[pid]:IsLoggedIn() then
+        return true
     end
+
+    local playerName = logicHandler.GetChatName(pid)
+
+    local message = playerName .. " failed to log in.\n"
+    tes3mp.SendMessage(pid, message, true)
+    Players[pid]:Kick()
+
+    Players[pid] = nil
+    return false
 end
 
 logicHandler.DoesPacketOriginRequireLoadedCell = function(packetOrigin)
@@ -369,119 +358,62 @@ logicHandler.SendConfigCollisionOverrides = function(pid, forEveryone)
     tes3mp.SendWorldCollisionOverride(pid, forEveryone)
 end
 
--- Create objects with newly assigned uniqueIndexes in a particular cell,
--- where the objectsToCreate parameter is an array of tables with refId
--- and location keys and packetType is either "spawn" or "place"
-logicHandler.CreateObjects = function(cellDescription, objectsToCreate, packetType)
+logicHandler.CreateObjectAtLocation = function(cellDescription, location, refId, packetType)
 
-    local uniqueIndexes = {}
-    local generatedRecordIdsPerType = {}
-    local unloadCellAtEnd = false
-    local shouldSendPacket = false
+    local mpNum = WorldInstance:GetCurrentMpNum() + 1
+    local uniqueIndex =  0 .. "-" .. mpNum
 
-    -- If the desired cell is not loaded, load it temporarily
-    if LoadedCells[cellDescription] == nil then
-        logicHandler.LoadCell(cellDescription)
-        unloadCellAtEnd = true
+    -- Is this a generated record? If so, add a link to it in the cell it
+    -- has been placed in
+    if logicHandler.IsGeneratedRecord(refId) then
+        local recordStore = logicHandler.GetRecordStoreByRecordId(refId)
+
+        if recordStore ~= nil then
+            LoadedCells[cellDescription]:AddLinkToRecord(recordStore.storeType, refId, uniqueIndex)
+
+            -- Do any of the visitors to this cell lack the generated record?
+            -- If so, send it to them
+            for _, visitorPid in pairs(LoadedCells[cellDescription].visitors) do
+                recordStore:LoadGeneratedRecords(visitorPid, recordStore.data.generatedRecords, { refId })
+            end
+        else
+            tes3mp.LogMessage(enumerations.log.ERROR, "Attempt at creating object based on non-existent generated record")
+            return
+        end
     end
 
-    local cell = LoadedCells[cellDescription]
+    WorldInstance:SetCurrentMpNum(mpNum)
+    tes3mp.SetCurrentMpNum(mpNum)
 
-    -- Only send a packet if there are players on the server to send it to
+    LoadedCells[cellDescription]:InitializeObjectData(uniqueIndex, refId)
+    LoadedCells[cellDescription].data.objectData[uniqueIndex].location = location
+
+    if packetType == "place" then
+        table.insert(LoadedCells[cellDescription].data.packets.place, uniqueIndex)
+    elseif packetType == "spawn" then
+        table.insert(LoadedCells[cellDescription].data.packets.spawn, uniqueIndex)
+        table.insert(LoadedCells[cellDescription].data.packets.actorList, uniqueIndex)
+    end
+
+    LoadedCells[cellDescription]:QuicksaveToDrive()
+
+    -- Are there any players on the server? If so, initialize the object
+    -- list for the first one we find and just send the corresponding packet
+    -- to everyone
     if tableHelper.getCount(Players) > 0 then
-        shouldSendPacket = true
+
+        local pid = tableHelper.getAnyValue(Players).pid
         tes3mp.ClearObjectList()
-    end
-
-    for _, object in pairs(objectsToCreate) do
-
-        local refId = object.refId
-        local location = object.location
-
-        local mpNum = WorldInstance:GetCurrentMpNum() + 1
-        local uniqueIndex =  0 .. "-" .. mpNum
-        local isValid = true
-
-        -- Is this object based on a a generated record? If so, it needs special
-        -- handling here and further below
-        if logicHandler.IsGeneratedRecord(refId) then
-            
-            local recordType = logicHandler.GetRecordTypeByRecordId(refId)
-
-            if RecordStores[recordType] ~= nil then
-
-                -- Add a link to this generated record in the cell it is being placed in
-                cell:AddLinkToRecord(recordType, refId, uniqueIndex)
-
-                if generatedRecordIdsPerType[recordType] == nil then
-                    generatedRecordIdsPerType[recordType] = {}
-                end
-
-                if shouldSendPacket and not tableHelper.containsValue(generatedRecordIdsPerType[recordType], refId) then
-                    table.insert(generatedRecordIdsPerType[recordType], refId)
-                end
-            else
-                isValid = false
-                tes3mp.LogMessage(enumerations.log.ERROR, "Attempt at creating object " .. refId ..
-                    " based on non-existent generated record")
-            end
-        end
-
-        if isValid then
-
-            table.insert(uniqueIndexes, uniqueIndex)
-            WorldInstance:SetCurrentMpNum(mpNum)
-            tes3mp.SetCurrentMpNum(mpNum)
-
-            cell:InitializeObjectData(uniqueIndex, refId)
-            cell.data.objectData[uniqueIndex].location = location
-
-            if packetType == "place" then
-                table.insert(cell.data.packets.place, uniqueIndex)
-            elseif packetType == "spawn" then
-                table.insert(cell.data.packets.spawn, uniqueIndex)
-                table.insert(cell.data.packets.actorList, uniqueIndex)
-            end
-
-            -- Are there any players on the server? If so, initialize the object
-            -- list for the first one we find and just send the corresponding packet
-            -- to everyone
-            if shouldSendPacket then
-
-                local pid = tableHelper.getAnyValue(Players).pid
-                tes3mp.SetObjectListPid(pid)
-                tes3mp.SetObjectListCell(cellDescription)
-                tes3mp.SetObjectRefId(refId)
-                tes3mp.SetObjectRefNum(0)
-                tes3mp.SetObjectMpNum(mpNum)
-                tes3mp.SetObjectCharge(-1)
-                tes3mp.SetObjectEnchantmentCharge(-1)
-                tes3mp.SetObjectPosition(location.posX, location.posY, location.posZ)
-                tes3mp.SetObjectRotation(location.rotX, location.rotY, location.rotZ)
-                tes3mp.AddObject()
-            end
-        end
-    end
-
-    if shouldSendPacket then
-
-        -- Ensure the visitors to this cell have the records they need for the
-        -- objects we've created
-        for _, recordType in pairs(config.recordStoreLoadOrder) do
-            if generatedRecordIdsPerType[recordType] ~= nil then
-
-                local recordStore = RecordStores[recordType]
-
-                if recordStore ~= nil then
-
-                    local idArray = generatedRecordIdsPerType[recordType]
-
-                    for _, visitorPid in pairs(cell.visitors) do
-                        recordStore:LoadGeneratedRecords(visitorPid, recordStore.data.generatedRecords, idArray)
-                    end
-                end
-            end
-        end
+        tes3mp.SetObjectListPid(pid)
+        tes3mp.SetObjectListCell(cellDescription)
+        tes3mp.SetObjectRefId(refId)
+        tes3mp.SetObjectRefNum(0)
+        tes3mp.SetObjectMpNum(mpNum)
+        tes3mp.SetObjectCharge(-1)
+        tes3mp.SetObjectEnchantmentCharge(-1)
+        tes3mp.SetObjectPosition(location.posX, location.posY, location.posZ)
+        tes3mp.SetObjectRotation(location.rotX, location.rotY, location.rotZ)
+        tes3mp.AddObject()
 
         if packetType == "place" then
             tes3mp.SendObjectPlace(true)
@@ -490,22 +422,7 @@ logicHandler.CreateObjects = function(cellDescription, objectsToCreate, packetTy
         end
     end
 
-    cell:Save()
-
-    if unloadCellAtEnd then
-        logicHandler.UnloadCell(cellDescription)
-    end
-
-    return uniqueIndexes
-end
-
-logicHandler.CreateObjectAtLocation = function(cellDescription, location, refId, packetType)
-
-    local objects = {}
-    table.insert(objects, { location = location, refId = refId, packetType = packetType })
-
-    local objectUniqueIndex = logicHandler.CreateObjects(cellDescription, objects, packetType)[1]
-    return objectUniqueIndex
+    return uniqueIndex
 end
 
 logicHandler.CreateObjectAtPlayer = function(pid, refId, packetType)
@@ -516,8 +433,7 @@ logicHandler.CreateObjectAtPlayer = function(pid, refId, packetType)
         rotX = tes3mp.GetRotX(pid), rotY = 0, rotZ = tes3mp.GetRotZ(pid)
     }
 
-    local objectUniqueIndex = logicHandler.CreateObjectAtLocation(cell, location, refId, packetType)[1]
-    return objectUniqueIndex
+    return logicHandler.CreateObjectAtLocation(cell, location, refId, packetType)
 end
 
 logicHandler.DeleteObject = function(pid, objectCellDescription, objectUniqueIndex, forEveryone)
@@ -613,7 +529,7 @@ logicHandler.IsGeneratedRecord = function(recordId)
     return false
 end
 
-logicHandler.GetRecordTypeByRecordId = function(recordId)
+logicHandler.GetRecordStoreByRecordId = function(recordId)
 
     local isGenerated = logicHandler.IsGeneratedRecord(recordId)
 
@@ -621,26 +537,20 @@ logicHandler.GetRecordTypeByRecordId = function(recordId)
         local recordType = string.match(recordId, "_(%a+)_")
 
         if RecordStores[recordType] ~= nil then
-            return recordType
+            return RecordStores[recordType]
         end
     end
 
     for _, storeType in pairs(config.recordStoreLoadOrder) do
 
         if isGenerated and RecordStores[storeType].data.generatedRecords[recordId] ~= nil then
-            return storeType
+            return RecordStores[storeType]
         elseif RecordStores[storeType].data.permanentRecords[recordId] ~= nil then
-            return storeType
+            return RecordStores[storeType]
         end
     end
 
     return nil
-end
-
-logicHandler.GetRecordStoreByRecordId = function(recordId)
-
-    local recordType = logicHandler.GetRecordTypeByRecordId(recordId)
-    return RecordStores[recordType]
 end
 
 logicHandler.ExchangeGeneratedRecords = function(pid, otherPidsArray)

@@ -478,7 +478,7 @@ end
 
 function BasePlayer:Resurrect()
 
-    local currentResurrectType = enumerations.resurrect.REGULAR
+    local currentResurrectType
 
     if config.respawnAtImperialShrine == true then
         if config.respawnAtTribunalTemple == true then
@@ -808,7 +808,7 @@ function BasePlayer:SaveSkills()
             local message = "Your base " .. name .. " has exceeded the maximum allowed value " ..
                 "and been reset to its last recorded one.\n"
             tes3mp.SendMessage(self.pid, message)
-        elseif (baseValue + modifierValue) > maxSkillValue and not config.ignoreModifierWithMaxSkill then
+        elseif (baseValue + modifierValue) > maxSkillValue then
             tes3mp.ClearSkillModifier(self.pid, skillId)
             tes3mp.SendSkills(self.pid)
 

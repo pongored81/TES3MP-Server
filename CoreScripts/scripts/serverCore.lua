@@ -25,7 +25,6 @@ guiHelper = require("guiHelper")
 animHelper = require("animHelper")
 speechHelper = require("speechHelper")
 menuHelper = require("menuHelper")
-require("defaultCommands")
 require("customScripts")
 
 Database = nil
@@ -34,7 +33,6 @@ Cell = nil
 RecordStore = nil
 World = nil
 
-pidsByIpAddress = {}
 clientDataFiles = {}
 speechCollections = {}
 
@@ -399,6 +397,9 @@ end
 function OnPlayerDisconnect(pid)
 
     tes3mp.LogMessage(enumerations.log.INFO, "Called \"OnPlayerDisconnect\" for " .. logicHandler.GetChatName(pid))
+    local message = logicHandler.GetChatName(pid) .. " left the server.\n"
+
+    tes3mp.SendMessage(pid, message, true)
 
     eventHandler.OnPlayerDisconnect(pid)
     DecrementAdminCounter()
